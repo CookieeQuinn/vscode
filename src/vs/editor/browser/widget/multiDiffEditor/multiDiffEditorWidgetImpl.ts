@@ -18,6 +18,7 @@ import { ITextEditorOptions } from '../../../../platform/editor/common/editor.js
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { ServiceCollection } from '../../../../platform/instantiation/common/serviceCollection.js';
 import { OffsetRange } from '../../../common/core/ranges/offsetRange.js';
+import { IDiffEditorOptions } from '../../../common/config/editorOptions.js';
 import { IRange } from '../../../common/core/range.js';
 import { ISelection, Selection } from '../../../common/core/selection.js';
 import { IDiffEditor } from '../../../common/editorCommon.js';
@@ -45,6 +46,8 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 
 	private readonly _objectPool;
 
+	private readonly _optionsOverride: IObservable<IDiffEditorOptions>;
+
 	public readonly scrollTop;
 	public readonly scrollLeft;
 
@@ -60,11 +63,21 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 	private readonly _contextKeyService;
 	private readonly _instantiationService;
 
+	/**
+	 * When `true`, the automatic "select the first change" initialization that
+	 * runs once the view model finishes loading does not move keyboard focus
+	 * into the editor. Driven by {@link setPreserveFocusOnLoad} so a
+	 * `preserveFocus` open (e.g. restored in the background or on a session
+	 * switch) does not steal focus, while a normal user-initiated open does.
+	 */
+	private _preserveFocusOnLoad = false;
+
 	constructor(
 		private readonly _element: HTMLElement,
 		private readonly _dimension: IObservable<Dimension | undefined>,
 		private readonly _viewModel: IObservable<MultiDiffEditorViewModel | undefined>,
 		private readonly _workbenchUIElementFactory: IWorkbenchUIElementFactory,
+		private readonly _renderSideBySide: IObservable<boolean | undefined>,
 		@IContextKeyService private readonly _parentContextKeyService: IContextKeyService,
 		@IInstantiationService private readonly _parentInstantiationService: IInstantiationService,
 	) {
@@ -93,12 +106,20 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 			h('div.placeholder@placeholder', {}, [h('div')]),
 		]);
 		this._sizeObserver = this._register(new ObservableElementSizeObserver(this._element, undefined));
+		this._optionsOverride = derived(this, reader => {
+			const renderSideBySide = this._renderSideBySide.read(reader);
+			// Also pin `useInlineViewWhenSpaceIsLimited` off so the toggle deterministically
+			// controls inline vs. side-by-side regardless of the available width.
+			const options: IDiffEditorOptions = renderSideBySide === undefined ? {} : { renderSideBySide, useInlineViewWhenSpaceIsLimited: false };
+			return options;
+		});
 		this._objectPool = this._register(new ObjectPool<TemplateData, DiffEditorItemTemplate>((data) => {
 			const template = this._instantiationService.createInstance(
 				DiffEditorItemTemplate,
 				this._scrollableElements.content,
 				this._scrollableElements.overflowWidgetsDomNode,
-				this._workbenchUIElementFactory
+				this._workbenchUIElementFactory,
+				this._optionsOverride,
 			);
 			template.setData(data);
 			return template;
@@ -142,6 +163,9 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 		this._instantiationService = this._register(this._parentInstantiationService.createChild(
 			new ServiceCollection([IContextKeyService, this._contextKeyService])
 		));
+
+		this._contextKeyService.createKey(EditorContextKeys.inMultiDiffEditor.key, true);
+
 		this._lastDocStates = {};
 
 		this._register(autorunWithStore((reader, store) => {
@@ -161,6 +185,14 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 			if (viewModel) {
 				const allCollapsed = viewModel.items.read(reader).every(item => item.collapsed.read(reader));
 				ctxAllCollapsed.set(allCollapsed);
+			}
+		}));
+
+		const ctxRenderSideBySide = this._parentContextKeyService.createKey<boolean>(EditorContextKeys.multiDiffEditorRenderSideBySide.key, true);
+		this._register(autorun((reader) => {
+			const renderSideBySide = this._renderSideBySide.read(reader);
+			if (renderSideBySide !== undefined) {
+				ctxRenderSideBySide.set(renderSideBySide);
 			}
 		}));
 
@@ -218,6 +250,38 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 			_element.replaceChildren();
 		}));
 
+		// Automatically select the first change in the first file when items are loaded
+		this._register(autorun(reader => {
+			/** @description Initialize first change */
+			const viewModel = this._viewModel.read(reader);
+			if (!viewModel) {
+				return;
+			}
+
+			// Only initialize when loading is complete
+			if (!viewModel.isLoading.read(reader)) {
+				const items = viewModel.items.read(reader);
+				if (items.length === 0) {
+					return;
+				}
+
+				// Only initialize if there's no active item yet
+				const activeDiffItem = viewModel.activeDiffItem.read(reader);
+				if (activeDiffItem) {
+					return;
+				}
+
+				// Navigate to the first change using the existing navigation
+				// logic. Whether this also moves keyboard focus into the editor
+				// is driven by the last `setViewModel` call: an editor opened
+				// with `preserveFocus` (e.g. restored in the background or on a
+				// session switch) must not steal focus from wherever the user is
+				// (such as the chat input), while a normal user-initiated open
+				// focuses the first change so the editor is ready to use.
+				this._navigateToChange('next', !this._preserveFocusOnLoad);
+			}
+		}));
+
 		this._register(this._register(autorun(reader => {
 			/** @description Render all */
 			globalTransaction(tx => {
@@ -230,6 +294,27 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 		this._scrollableElement.setScrollPosition({ scrollLeft: scrollState.left, scrollTop: scrollState.top });
 	}
 
+	/**
+	 * Controls whether the automatic first-change selection that runs once the
+	 * view model finishes loading preserves focus instead of moving it into the
+	 * editor. Set to `true` for `preserveFocus` opens so focus is not stolen
+	 * from elsewhere.
+	 */
+	public setPreserveFocusOnLoad(preserveFocus: boolean): void {
+		this._preserveFocusOnLoad = preserveFocus;
+	}
+
+	public getRootElement(): HTMLElement {
+		return this._elements.root;
+	}
+
+	public getContextKeyService(): IContextKeyService {
+		return this._contextKeyService;
+	}
+
+	public getScopedInstantiationService(): IInstantiationService {
+		return this._instantiationService;
+	}
 	public reveal(resource: IMultiDiffResourceId, options?: RevealOptions): void {
 		const viewItems = this._viewItems.get();
 		const index = viewItems.findIndex(
@@ -309,6 +394,76 @@ export class MultiDiffEditorWidgetImpl extends Disposable {
 			return { diffEditor: editor, editor: editor.getModifiedEditor() };
 		} else {
 			return { diffEditor: editor, editor: editor.getOriginalEditor() };
+		}
+	}
+
+	public goToNextChange(): void {
+		this._navigateToChange('next');
+	}
+
+	public goToPreviousChange(): void {
+		this._navigateToChange('previous');
+	}
+
+	private _navigateToChange(direction: 'next' | 'previous', focusEditor: boolean = true): void {
+		const viewItems = this._viewItems.get();
+		if (viewItems.length === 0) {
+			return;
+		}
+
+		const activeViewModel = this._viewModel.get()?.activeDiffItem.get();
+		const currentIndex = activeViewModel ? viewItems.findIndex(v => v.viewModel === activeViewModel) : -1;
+
+		// Start with first file if no active item
+		if (currentIndex === -1) {
+			this._goToFile(0, 'first', focusEditor);
+			return;
+		}
+
+		// Try current file first - expand if collapsed
+		const currentItem = viewItems[currentIndex];
+		if (currentItem.viewModel.collapsed.get()) {
+			currentItem.viewModel.collapsed.set(false, undefined);
+		}
+
+		const editor = currentItem.template.get()?.editor;
+		if (editor?.getDiffComputationResult()?.changes2?.length) {
+			const pos = editor.getModifiedEditor().getPosition()?.lineNumber || 1;
+			const changes = editor.getDiffComputationResult()!.changes2!;
+			const hasNext = direction === 'next' ? changes.some(c => c.modified.startLineNumber > pos) : changes.some(c => c.modified.endLineNumberExclusive <= pos);
+
+			if (hasNext) {
+				editor.goToDiff(direction);
+				return;
+			}
+		}
+
+		// Move to next/previous file
+		const nextIndex = (currentIndex + (direction === 'next' ? 1 : -1) + viewItems.length) % viewItems.length;
+		this._goToFile(nextIndex, direction === 'next' ? 'first' : 'last', focusEditor);
+	}
+
+	private _goToFile(index: number, position: 'first' | 'last', focusEditor: boolean = true): void {
+		const item = this._viewItems.get()[index];
+		if (item.viewModel.collapsed.get()) {
+			item.viewModel.collapsed.set(false, undefined);
+		}
+
+		this.reveal({ original: item.viewModel.originalUri, modified: item.viewModel.modifiedUri });
+
+		const editor = item.template.get()?.editor;
+		if (editor?.getDiffComputationResult()?.changes2?.length) {
+			if (position === 'first') {
+				editor.revealFirstDiff();
+			} else {
+				const lastChange = editor.getDiffComputationResult()!.changes2!.at(-1)!;
+				const modifiedEditor = editor.getModifiedEditor();
+				modifiedEditor.setPosition({ lineNumber: lastChange.modified.startLineNumber, column: 1 });
+				modifiedEditor.revealLineInCenter(lastChange.modified.startLineNumber);
+			}
+		}
+		if (focusEditor) {
+			editor?.focus();
 		}
 	}
 
